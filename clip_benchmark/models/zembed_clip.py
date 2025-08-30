@@ -1,8 +1,9 @@
-from typing import Dict, cast, Any
+from typing import cast, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL.Image import Image, Resampling
+from peft import PeftModel
 
 from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.auto.tokenization_auto import AutoTokenizer
@@ -22,7 +23,7 @@ def get_model(
 ) -> tuple[
     Qwen3Model,
     PreTrainedTokenizerFast,
-    Qwen2_5_VisionTransformerPretrainedModel,
+    Qwen2_5_VLForConditionalGeneration,
     Qwen2_5_VLProcessor,
 ]:
     """Load all models and setup training configuration"""
@@ -35,29 +36,29 @@ def get_model(
     assert isinstance(processor, Qwen2_5_VLProcessor)
 
     # Extract components
-    visual_encoder = multimodal.visual
+    visual = multimodal.visual
     embedding_model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-4B")
     tokenizer = AutoTokenizer.from_pretrained(
         "Qwen/Qwen3-Embedding-4B", padding_side="right"
     )
 
     # Move to device
-    visual_encoder = visual_encoder.to(device)  # pyright: ignore[reportArgumentType]
+    visual = visual.to(device)  # pyright: ignore[reportArgumentType]
     embedding_model = embedding_model.to(device)
 
     # Add final projection to match dimensions
     # Get dimensions from merger config
-    vision_dim = visual_encoder.merger.mlp[
+    vision_dim = visual.merger.mlp[
         -1
     ].out_features  # Output dimension from final linear layer
     text_dim = embedding_model.config.hidden_size  # Text embedding dimension
 
     if vision_dim != text_dim:
-        visual_encoder.config.out_hidden_size = text_dim
-        visual_encoder.merger = Qwen2_5_VLPatchMerger(
-            dim=visual_encoder.config.out_hidden_size,  # pyright: ignore[reportUnknownArgumentType]
-            context_dim=visual_encoder.config.hidden_size,  # pyright: ignore[reportUnknownArgumentType]
-            spatial_merge_size=visual_encoder.config.spatial_merge_size,  # pyright: ignore[reportUnknownArgumentType]
+        visual.config.out_hidden_size = text_dim
+        visual.merger = Qwen2_5_VLPatchMerger(
+            dim=visual.config.out_hidden_size,  # pyright: ignore[reportUnknownArgumentType]
+            context_dim=visual.config.hidden_size,  # pyright: ignore[reportUnknownArgumentType]
+            spatial_merge_size=visual.config.spatial_merge_size,  # pyright: ignore[reportUnknownArgumentType]
         ).to(device)
 
     # Freeze all parameters in embedding model
@@ -66,9 +67,9 @@ def get_model(
         param.requires_grad = False
 
     # Freeze vision transformer except merger
-    visual_encoder.eval()
-    # visual_encoder.gradient_checkpointing_enable()
-    for name, param in visual_encoder.named_parameters():
+    visual.eval()
+    # visual.gradient_checkpointing_enable()
+    for name, param in visual.named_parameters():
         if "merger" not in name:
             param.requires_grad = False
 
@@ -78,13 +79,13 @@ def get_model(
         print("PARAMETER COUNTS")
         print("=" * 60)
 
-        visual_total = sum(p.numel() for p in visual_encoder.parameters())
+        visual_total = sum(p.numel() for p in visual.parameters())
         visual_trainable = sum(
-            p.numel() for p in visual_encoder.parameters() if p.requires_grad
+            p.numel() for p in visual.parameters() if p.requires_grad
         )
         emb_total = sum(p.numel() for p in cast(Any, embedding_model.parameters()))
         merger_params = sum(
-            p.numel() for p in visual_encoder.merger.parameters() if p.requires_grad
+            p.numel() for p in visual.merger.parameters() if p.requires_grad
         )
 
         print(
@@ -97,21 +98,42 @@ def get_model(
         )
         print("=" * 60)
 
-    return embedding_model, tokenizer, visual_encoder, processor
+    return embedding_model, tokenizer, multimodal, processor
 
 
 class ZembedModel:
     def __init__(self, path: str, device: torch.device):
-        embedding_model, tokenizer, visual_encoder, processor = get_model(0, device)
+        embedding_model, tokenizer, multimodal, processor = get_model(0, device)
 
-        merger_state_dict = torch.load(
-            "/home/user/ml/data/checkpoints/pretrained_merger_hard_negatives/epoch-001-step-54250/model.pth"
+        merger_path = "/home/user/ml/data/checkpoints/pretrained_merger_hard_negatives/epoch-001-step-54250/model.pth"
+        peft_path = "/home/user/ml/data/checkpoints/pretrained_merger_hard_negatives_lora/epoch-001-step-64600"
+
+        # Load merger state
+        visual = multimodal.visual
+        assert isinstance(visual, Qwen2_5_VisionTransformerPretrainedModel)
+        merger_state_dict = torch.load(merger_path)
+        visual.merger.load_state_dict(merger_state_dict)
+
+        # Load LoRA
+        model = PeftModel.from_pretrained(
+            embedding_model,
+            f"{peft_path}/embedding",
         )
-        visual_encoder.merger.load_state_dict(merger_state_dict)
+        model = model.merge_and_unload()  # pyright: ignore[reportCallIssue]
+        assert isinstance(model, Qwen3Model)
+        embedding_model = model
+
+        model = PeftModel.from_pretrained(
+            visual,
+            f"{peft_path}/visual",
+        )
+        model = model.merge_and_unload()  # pyright: ignore[reportCallIssue]
+        assert isinstance(model, Qwen2_5_VisionTransformerPretrainedModel)
+        visual = model
 
         self.embedding_model = embedding_model
         self.tokenizer = tokenizer
-        self.visual_encoder = visual_encoder
+        self.visual = visual
         self.processor = processor
         self.device = device
 
@@ -158,11 +180,11 @@ class ZembedModel:
         seq_lengths = [
             int(seq_len)
             for seq_len in image_grid_thw[:, 0]
-            * (image_grid_thw[:, 1] // self.visual_encoder.spatial_merge_size)
-            * (image_grid_thw[:, 2] // self.visual_encoder.spatial_merge_size)
+            * (image_grid_thw[:, 1] // self.visual.spatial_merge_size)
+            * (image_grid_thw[:, 2] // self.visual.spatial_merge_size)
         ]
 
-        vision_embeddings = self.visual_encoder(pixel_values, grid_thw=image_grid_thw)
+        vision_embeddings = self.visual(pixel_values, grid_thw=image_grid_thw)
 
         # Find max sequence length for padding
         max_seq_len = max(seq_lengths) + 1  # +1 for the end token

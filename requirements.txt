@@ -5,4 +5,5 @@ scikit-learn>=1.0,<2
 open_clip_torch>=0.2.1
 pycocoevalcap
 webdataset>=0.2.31
-transformers
+transformers @ git+https://github.com/zeroentropy-ai/transformers.git@a76d9ddc60bc3e11d1209e358a4bcc95c7ed1cbc
+peft==0.15.1
