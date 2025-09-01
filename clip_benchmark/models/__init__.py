@@ -2,11 +2,13 @@ from typing import Union
 import torch
 from .open_clip import load_open_clip
 from .japanese_clip import load_japanese_clip
+from .zembed_clip import load_zembed_clip
 
 # loading function must return (model, transform, tokenizer)
 TYPE2FUNC = {
     "open_clip": load_open_clip,
-    "ja_clip": load_japanese_clip
+    "ja_clip": load_japanese_clip,
+    "zembed_clip": load_zembed_clip,
 }
 MODEL_TYPES = list(TYPE2FUNC.keys())
 
